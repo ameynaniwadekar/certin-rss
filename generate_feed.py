@@ -1,181 +1,144 @@
-import os
-import json
-import pandas as pd
-import requests
 
+#!/usr/bin/env python3
+"""
+generate_feed.py
+CERT-In Vulnerability Notes RSS Generator
+
+NOTE:
+This is a production-oriented skeleton based on the uploaded CERT-In HTML
+structure. Replace LIST_URL if CERT-In changes the endpoint.
+"""
+
+import csv
+import json
+import logging
+from datetime import datetime
+from email.utils import format_datetime
+from pathlib import Path
+
+import requests
 from bs4 import BeautifulSoup
 from feedgen.feed import FeedGenerator
 
-URL = "https://www.cert-in.org.in/s2cMainServlet?pageid=VLNLIST02&year=2026"
+BASE_URL = "https://www.cert-in.org.in"
+LIST_URL = BASE_URL + "/s2cMainServlet?pageid=PUBVLNLIST"
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0"
-}
+OUT_DIR = Path("docs")
+OUT_DIR.mkdir(exist_ok=True)
 
-OUTPUT_DIR = "docs"
+RSS_FILE = OUT_DIR / "feed.xml"
+JSON_FILE = OUT_DIR / "advisories.json"
+CSV_FILE = OUT_DIR / "advisories.csv"
 
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
-print("Downloading CERT-In page...")
 
-response = requests.get(URL, headers=HEADERS, timeout=30)
-response.raise_for_status()
+def get(url):
+    r = requests.get(url, timeout=30)
+    r.raise_for_status()
+    return r.text
 
-print("Status:", response.status_code)
 
-soup = BeautifulSoup(response.text, "lxml")
+def parse_list(html):
+    soup = BeautifulSoup(html, "html.parser")
 
-records = []
+    advisories = []
+    current_date = None
 
-#########################################################################
-# Parse all table rows
-#########################################################################
-
-tables = soup.find_all("table")
-
-for table in tables:
-
-    rows = table.find_all("tr")
-
-    for row in rows:
-
-        cols = row.find_all("td")
-
-        if len(cols) < 3:
+    for tr in soup.find_all("tr"):
+        date_span = tr.find("span", class_="DateContent")
+        if date_span:
+            current_date = date_span.get_text(strip=True).strip("()")
             continue
 
+        a = tr.find("a", href=lambda h: h and "PUBVLNOTES01" in h)
+        if not a:
+            continue
+
+        href = a["href"]
+        if href.startswith("/"):
+            href = BASE_URL + href
+
+        civn = href.split("VLCODE=")[-1]
+
+        title = a.get_text(" ", strip=True)
+
+        advisories.append({
+            "id": civn,
+            "title": title,
+            "date": current_date,
+            "url": href,
+        })
+
+    return advisories
+
+
+def parse_detail(item):
+    try:
+        html = get(item["url"])
+        soup = BeautifulSoup(html, "html.parser")
+        text = " ".join(soup.stripped_strings)
+        item["description"] = text[:4000]
+    except Exception as exc:
+        logging.warning("Failed %s: %s", item["id"], exc)
+        item["description"] = ""
+
+    return item
+
+
+def write_json(items):
+    JSON_FILE.write_text(json.dumps(items, indent=2), encoding="utf-8")
+
+
+def write_csv(items):
+    with open(CSV_FILE, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(
+            f,
+            fieldnames=["id", "date", "title", "url", "description"],
+        )
+        w.writeheader()
+        w.writerows(items)
+
+
+def write_rss(items):
+    fg = FeedGenerator()
+    fg.title("CERT-In Vulnerability Notes")
+    fg.link(href=LIST_URL)
+    fg.description("Generated CERT-In RSS Feed")
+
+    for item in items:
+        fe = fg.add_entry()
+        fe.guid(item["url"], permalink=True)
+        fe.id(item["url"])
+        fe.title(item["title"])
+        fe.link(href=item["url"])
+        fe.description(item["description"])
+
         try:
-
-            date = cols[0].get_text(" ", strip=True)
-
-            anchor = cols[1].find("a")
-
-            if anchor:
-
-                title = anchor.get_text(" ", strip=True)
-
-                href = anchor.get("href", "")
-
-                if href.startswith("http"):
-                    link = href
-                else:
-                    link = requests.compat.urljoin(URL, href)
-
-            else:
-                title = cols[1].get_text(" ", strip=True)
-                link = URL
-
-            civn = cols[2].get_text(" ", strip=True)
-
-            if not civn:
-                continue
-
-            records.append({
-                "CIVN": civn,
-                "Date": date,
-                "Title": title,
-                "URL": link
-            })
-
+            dt = datetime.strptime(item["date"], "%B %d, %Y")
         except Exception:
-            pass
+            dt = datetime.utcnow()
 
-#########################################################################
-# Remove duplicates
-#########################################################################
+        fe.pubDate(format_datetime(dt))
 
-unique = []
+    fg.rss_file(str(RSS_FILE))
 
-seen = set()
 
-for r in records:
+def main():
+    logging.info("Downloading list...")
+    html = get(LIST_URL)
 
-    if r["CIVN"] in seen:
-        continue
+    items = parse_list(html)
+    logging.info("Found %d advisories", len(items))
 
-    seen.add(r["CIVN"])
+    items = [parse_detail(x) for x in items]
 
-    unique.append(r)
+    write_json(items)
+    write_csv(items)
+    write_rss(items)
 
-records = unique
+    logging.info("Done.")
 
-print("Advisories found:", len(records))
 
-#########################################################################
-# JSON
-#########################################################################
-
-json_file = os.path.join(OUTPUT_DIR, "advisories.json")
-
-with open(json_file, "w", encoding="utf-8") as f:
-    json.dump(records, f, indent=4)
-
-#########################################################################
-# CSV
-#########################################################################
-
-csv_file = os.path.join(OUTPUT_DIR, "advisories.csv")
-
-pd.DataFrame(records).to_csv(csv_file, index=False)
-
-#########################################################################
-# RSS
-#########################################################################
-
-fg = FeedGenerator()
-
-fg.id(URL)
-
-fg.title("CERT-In Vulnerability Feed")
-
-fg.link(href=URL)
-
-fg.description("Unofficial CERT-In Vulnerability RSS Feed")
-
-fg.language("en")
-
-for item in records:
-
-    fe = fg.add_entry()
-
-    fe.id(item["CIVN"])
-
-    fe.title(f"{item['CIVN']} - {item['Title']}")
-
-    fe.link(href=item["URL"])
-
-    fe.description(
-        f"""
-CIVN: {item['CIVN']}
-
-Date: {item['Date']}
-
-Title: {item['Title']}
-
-Reference:
-{item['URL']}
-"""
-    )
-
-rss_file = os.path.join(OUTPUT_DIR, "feed.xml")
-
-fg.rss_file(rss_file)
-
-#########################################################################
-# previous.json
-#########################################################################
-
-with open("previous.json", "w") as f:
-    json.dump([x["CIVN"] for x in records], f, indent=4)
-
-#########################################################################
-
-print()
-
-print("RSS Generated :", rss_file)
-
-print("JSON Generated:", json_file)
-
-print("CSV Generated :", csv_file)
-
-print("Done.")
+if __name__ == "__main__":
+    main()
